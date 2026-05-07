@@ -6,7 +6,6 @@ use drm::control::{
     AtomicCommitFlags, Mode, PlaneType, connector, crtc, dumbbuffer::DumbBuffer, framebuffer, plane, property,
 };
 
-#[cfg(debug_assertions)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(debug_assertions)]
@@ -35,6 +34,7 @@ use crate::{
 
 use tracing::{debug, info, info_span, instrument, trace, warn};
 
+use super::hdr::HdrState;
 use super::{PlaneConfig, PlaneState, VrrSupport};
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,12 @@ pub struct State {
     pub blob: property::Value<'static>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
+    /// Per-connector HDR signaling state (Colorspace + HDR_OUTPUT_METADATA).
+    /// Empty / unset connectors get no HDR property writes during atomic
+    /// commit, leaving them in whatever the kernel last set them to (which
+    /// for first-boot connectors is SDR / Rec.709). Populated via
+    /// `AtomicDrmSurface::set_hdr_state`. See `super::hdr` module docs.
+    pub hdr_state: HashMap<connector::Handle, HdrState>,
 }
 
 impl PartialEq for State {
@@ -53,6 +59,7 @@ impl PartialEq for State {
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
+            && self.hdr_state == other.hdr_state
     }
 }
 
@@ -150,6 +157,8 @@ impl State {
             // If we don't know the VRR state, the driver doesn't support the property
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
+            // HDR opts in via `AtomicDrmSurface::set_hdr_state`; default empty.
+            hdr_state: HashMap::new(),
         })
     }
 
@@ -159,6 +168,7 @@ impl State {
         self.connectors.clear();
         self.active = false;
         self.vrr = false;
+        self.hdr_state.clear();
     }
 }
 
@@ -207,6 +217,7 @@ impl AtomicDrmSurface {
             blob,
             vrr: false,
             connectors: connectors.iter().copied().collect(),
+            hdr_state: HashMap::new(),
         };
 
         drop(_guard);
@@ -281,6 +292,54 @@ impl AtomicDrmSurface {
 
     pub fn pending_connectors(&self) -> HashSet<connector::Handle> {
         self.pending.read().unwrap().connectors.clone()
+    }
+
+    /// Read a copy of the per-connector HDR signaling state currently committed
+    /// to the kernel. See `super::hdr` for context on what this controls.
+    pub fn current_hdr_state(&self) -> HashMap<connector::Handle, HdrState> {
+        self.state.read().unwrap().hdr_state.clone()
+    }
+
+    /// Read a copy of the per-connector HDR signaling state to be applied on
+    /// the next atomic commit (set via `set_hdr_state`).
+    pub fn pending_hdr_state(&self) -> HashMap<connector::Handle, HdrState> {
+        self.pending.read().unwrap().hdr_state.clone()
+    }
+
+    /// Set or clear per-connector HDR signaling state. The values are written
+    /// as part of every subsequent atomic commit on this surface, ensuring the
+    /// panel-side InfoFrame state survives across render flips (legacy
+    /// `set_property` writes get clobbered by smithay's atomic commits because
+    /// blob property refs reset to 0 if not explicitly included in the commit).
+    ///
+    /// Pass `Some(HdrState)` to enable HDR on the connector or update its
+    /// metadata. Pass `None` to remove tracked HDR state for the connector
+    /// (kernel keeps the most recently set values until another commit clears
+    /// them — usually the caller wants to follow up with `Some(HdrState::sdr())`
+    /// to explicitly transition the connector to SDR).
+    ///
+    /// Validation is the caller's responsibility: smithay does not check that
+    /// `colorspace_value` corresponds to a valid enum variant on the connector,
+    /// nor that `metadata_blob_id` references a live blob. Both are handed to
+    /// the kernel as raw `u64`s during atomic commit.
+    pub fn set_hdr_state(
+        &self,
+        conn: connector::Handle,
+        state: Option<HdrState>,
+    ) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+        let mut pending = self.pending.write().unwrap();
+        match state {
+            Some(s) => {
+                pending.hdr_state.insert(conn, s);
+            }
+            None => {
+                pending.hdr_state.remove(&conn);
+            }
+        }
+        Ok(())
     }
 
     pub fn current_mode(&self) -> Mode {
@@ -365,6 +424,7 @@ impl AtomicDrmSurface {
                 &connectors,
                 [],
                 [&plane_state],
+                &pending.hdr_state,
             )?;
             self.fd
                 .atomic_commit(
@@ -424,6 +484,7 @@ impl AtomicDrmSurface {
             &connectors,
             [&conn],
             [&plane_state],
+            &pending.hdr_state,
         )?;
         self.fd
             .atomic_commit(
@@ -481,6 +542,7 @@ impl AtomicDrmSurface {
             &conns,
             removed,
             [&plane_state],
+            &pending.hdr_state,
         )?;
 
         self.fd
@@ -535,6 +597,7 @@ impl AtomicDrmSurface {
             pending.connectors.iter(),
             [],
             [&plane_state],
+            &pending.hdr_state,
         )?;
         if let Err(err) = self
             .fd
@@ -658,6 +721,7 @@ impl AtomicDrmSurface {
             &pending.connectors,
             &[],
             [&plane_config],
+            &pending.hdr_state,
         )?;
 
         if *current == *pending {
@@ -728,6 +792,7 @@ impl AtomicDrmSurface {
             &pending_conns,
             removed,
             &*planes,
+            &pending.hdr_state,
         )?;
 
         let flags = if allow_modeset {
@@ -800,6 +865,7 @@ impl AtomicDrmSurface {
                 &pending_conns,
                 removed,
                 &*planes,
+                &pending.hdr_state,
             )?;
 
             if let Err(err) = self.fd.atomic_commit(
@@ -878,15 +944,21 @@ impl AtomicDrmSurface {
         let planes = planes.into_iter().collect::<Vec<_>>();
 
         // page flips work just like commits with fewer parameters..
+        // The connector list is empty so the HDR-state loop in build_request is
+        // a no-op for plain page flips; we pass the committed-state map for
+        // consistency only — connector props are sticky across page flips on
+        // atomic drivers and don't need re-writing per frame.
+        let state_lock = self.state.read().unwrap();
         let prop_mapping = self.prop_mapping.read().unwrap();
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             None,
-            self.state.read().unwrap().vrr,
+            state_lock.vrr,
             [],
             [],
             &*planes,
+            &state_lock.hdr_state,
         )?;
 
         // .. and without `AtomicCommitFlags::AllowModeset`.
@@ -1169,6 +1241,28 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
+    /// Stage Colorspace + HDR_OUTPUT_METADATA writes for the connector. The
+    /// raw u64 values stored here are passed through `AtomicRequest::build()`
+    /// to `AtomicModeReq::add_property` which discards `property::Value` typing
+    /// and writes the underlying `RawValue` directly — the kernel then matches
+    /// it against the property's actual type (enum / blob) by handle.
+    fn set_connector_hdr(
+        &mut self,
+        conn: connector::Handle,
+        hdr: HdrState,
+    ) -> Result<(), Error> {
+        let connector_props = self.connector_props.entry(conn).or_default();
+        connector_props.insert(
+            "Colorspace",
+            property::Value::UnsignedRange(hdr.colorspace_value),
+        );
+        connector_props.insert(
+            "HDR_OUTPUT_METADATA",
+            property::Value::Blob(hdr.metadata_blob_id),
+        );
+        Ok(())
+    }
+
     fn set_crtc(
         &mut self,
         crtc: crtc::Handle,
@@ -1367,6 +1461,27 @@ impl<'a> AtomicRequest<'a> {
             conn,
             self.mapping.conn_prop_handle(conn, "CRTC_ID")?,
             property::Value::CRTC(None),
+        );
+        Ok(())
+    }
+
+    /// See debug-mode `set_connector_hdr` for documentation. Release mode
+    /// writes directly to the underlying `AtomicModeReq` rather than going
+    /// through the per-object HashMap.
+    fn set_connector_hdr(
+        &mut self,
+        conn: connector::Handle,
+        hdr: HdrState,
+    ) -> Result<(), Error> {
+        self.request.add_property(
+            conn,
+            self.mapping.conn_prop_handle(conn, "Colorspace")?,
+            property::Value::UnsignedRange(hdr.colorspace_value),
+        );
+        self.request.add_property(
+            conn,
+            self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA")?,
+            property::Value::Blob(hdr.metadata_blob_id),
         );
         Ok(())
     }
@@ -1632,15 +1747,22 @@ impl<'a> AtomicRequest<'a> {
         connectors: impl IntoIterator<Item = &'a connector::Handle>,
         removed_connectors: impl IntoIterator<Item = &'a connector::Handle>,
         planes: impl IntoIterator<Item = &'a PlaneState<'a>>,
+        hdr_state: &HashMap<connector::Handle, HdrState>,
     ) -> Result<AtomicRequest<'a>, Error> {
         let mut req = AtomicRequest::new(mapping);
 
         // requests consist out of a set of properties and their new values
         // for different drm objects (crtc, plane, connector, ...).
 
-        // for every connector that is new, we need to set our crtc_id
+        // for every connector that is new, we need to set our crtc_id —
+        // and if it has tracked HDR state, also write Colorspace +
+        // HDR_OUTPUT_METADATA so panel firmware re-receives the HDR
+        // InfoFrame on every flip rather than going stale.
         for conn in connectors {
             req.set_connector(*conn, crtc)?;
+            if let Some(hdr) = hdr_state.get(conn) {
+                req.set_connector_hdr(*conn, *hdr)?;
+            }
         }
 
         // for every connector that got removed, we need to set no crtc_id.

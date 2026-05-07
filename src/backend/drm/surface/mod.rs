@@ -11,7 +11,9 @@ use libc::dev_t;
 pub(super) mod atomic;
 #[cfg(feature = "backend_gbm")]
 pub(super) mod gbm;
+pub mod hdr;
 pub(super) mod legacy;
+pub use hdr::HdrState;
 use super::{
     DrmDeviceFd, PlaneClaim, PlaneInfo, PlaneType, Planes, device::PlaneClaimStorage, error::Error,
     plane_type,
