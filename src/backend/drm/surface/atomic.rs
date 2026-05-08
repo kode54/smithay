@@ -330,13 +330,26 @@ impl AtomicDrmSurface {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
+        // Update BOTH pending AND current state. HDR connector props are
+        // "sticky" — once committed they persist on the connector indefinitely
+        // — so for the purpose of `commit_pending()` (which compares pending
+        // vs current) we treat HDR state as immediately-applied bookkeeping.
+        // Without updating current here, pending and current would forever
+        // disagree after `set_hdr_state`, making `commit_pending()` always
+        // return `true`, which routes every render-flip through the full
+        // `commit()` path (with all connector state including HDR) instead
+        // of the lighter `page_flip()`. On Intel `xe`, that combination is
+        // rejected → "Failed to submit rendering" every frame.
         let mut pending = self.pending.write().unwrap();
+        let mut current = self.state.write().unwrap();
         match state {
             Some(s) => {
                 pending.hdr_state.insert(conn, s);
+                current.hdr_state.insert(conn, s);
             }
             None => {
                 pending.hdr_state.remove(&conn);
+                current.hdr_state.remove(&conn);
             }
         }
         Ok(())
@@ -713,6 +726,15 @@ impl AtomicDrmSurface {
             }),
         };
 
+        // VRR feasibility test: build the request WITHOUT pending.hdr_state.
+        // The Intel `xe` driver (and at least one other tested config) rejects
+        // any TEST_ONLY commit that contains an HDR_OUTPUT_METADATA blob even
+        // when the same combination is accepted in a non-test commit. Including
+        // HDR here would make every VRR check spuriously fail and cascade into
+        // "New screen configuration invalid!" + render-submit errors.
+        // HDR connector state continues to be applied via mode-set / connector
+        // attach commits which are real (non-test) and accepted by the driver.
+        let empty_hdr: HashMap<connector::Handle, HdrState> = HashMap::new();
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
@@ -721,7 +743,7 @@ impl AtomicDrmSurface {
             &pending.connectors,
             &[],
             [&plane_config],
-            &pending.hdr_state,
+            &empty_hdr,
         )?;
 
         if *current == *pending {
@@ -855,25 +877,33 @@ impl AtomicDrmSurface {
         trace!("Testing screen config");
 
         // test the new config and return the request if it would be accepted by the driver.
+        // Build TWO requests: one without `hdr_state` for the TEST_ONLY commit
+        // (the Intel `xe` driver rejects HDR_OUTPUT_METADATA inside test commits
+        // even when the same combination is accepted in a real commit), and one
+        // WITH `hdr_state` for the real commit afterward.
         let prop_mapping = self.prop_mapping.read().unwrap();
+        let empty_hdr: HashMap<connector::Handle, HdrState> = HashMap::new();
         let req = {
-            let req = AtomicRequest::build_request(
+            // -- test commit (no HDR) --
+            let test_req = AtomicRequest::build_request(
                 &prop_mapping,
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
                 &pending_conns,
-                removed,
+                removed.clone(),
                 &*planes,
-                &pending.hdr_state,
+                &empty_hdr,
             )?;
 
             if let Err(err) = self.fd.atomic_commit(
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
-                req.build()?,
+                test_req.build()?,
             ) {
-                warn!("New screen configuration invalid!:\n\t{:?}\n\t{}\n", req, err);
-
+                warn!(
+                    "New screen configuration invalid!:\n\t{:?}\n\t{}\n",
+                    test_req, err
+                );
                 return Err(Error::TestFailed(self.crtc));
             } else {
                 if current.mode != pending.mode {
@@ -881,9 +911,17 @@ impl AtomicDrmSurface {
                         warn!("Failed to destroy old mode property blob: {}", err);
                     }
                 }
-
-                // new config
-                req
+                // -- real commit request (WITH HDR) — used at line ~900 below --
+                AtomicRequest::build_request(
+                    &prop_mapping,
+                    self.crtc,
+                    Some(pending.blob),
+                    pending.vrr,
+                    &pending_conns,
+                    removed,
+                    &*planes,
+                    &pending.hdr_state,
+                )?
             }
         };
 

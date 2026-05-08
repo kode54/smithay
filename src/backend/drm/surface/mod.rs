@@ -343,6 +343,29 @@ impl DrmSurface {
         }
     }
 
+    /// Stage HDR signaling state to be applied per-connector on every atomic
+    /// commit on this surface (Colorspace + HDR_OUTPUT_METADATA). Pass `None`
+    /// to remove tracked state for the connector. See [`hdr`] for details on
+    /// what the values control and why this needs to be re-applied per commit
+    /// rather than written once via legacy `set_property`.
+    ///
+    /// Returns [`Error::UnknownProperty`] on legacy (non-atomic) DRM backends
+    /// since HDR signaling without atomic-commit semantics has no way to
+    /// guarantee blob-property persistence across mode changes.
+    pub fn set_hdr_state(
+        &self,
+        connector: connector::Handle,
+        state: Option<HdrState>,
+    ) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.set_hdr_state(connector, state),
+            DrmSurfaceInternal::Legacy(_) => Err(Error::UnknownProperty {
+                handle: self.crtc.into(),
+                name: "HDR_OUTPUT_METADATA",
+            }),
+        }
+    }
+
     /// Disables the given plane.
     ///
     /// Errors if the plane is not supported by this crtc or if the underlying
