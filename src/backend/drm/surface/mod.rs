@@ -366,6 +366,18 @@ impl DrmSurface {
         }
     }
 
+    /// Read a copy of the per-connector HDR signaling state currently committed
+    /// to the kernel via this surface. Returns an empty map on legacy
+    /// (non-atomic) DRM backends. Useful for live-update flows that want to
+    /// regenerate just one CTM/LUT blob and splice it into the existing state
+    /// without losing colorspace / mastering metadata / sibling LUT blobs.
+    pub fn current_hdr_state(&self) -> std::collections::HashMap<connector::Handle, HdrState> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.current_hdr_state(),
+            DrmSurfaceInternal::Legacy(_) => std::collections::HashMap::new(),
+        }
+    }
+
     /// Disables the given plane.
     ///
     /// Errors if the plane is not supported by this crtc or if the underlying

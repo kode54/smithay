@@ -32,6 +32,17 @@
 /// `colorspace_value = 0` and `metadata_blob_id = 0` together mean "back to
 /// SDR" — same as never having set HDR on the connector. Clearing one without
 /// the other can leave the panel in a wedged half-HDR state on some firmwares.
+///
+/// The CRTC color pipeline fields (`degamma_lut_blob_id`, `ctm_blob_id`,
+/// `gamma_lut_blob_id`) are an OPTIONAL hardware-accelerated path: when
+/// supplied, smithay stages the corresponding CRTC properties (`DEGAMMA_LUT`,
+/// `CTM`, `GAMMA_LUT`) in every atomic commit alongside the connector
+/// Colorspace + HDR_OUTPUT_METADATA. The kernel runs the operations in
+/// fixed-function display-engine hardware after composition / before scanout,
+/// freeing the GPU shader from doing per-pixel sRGB-decode + matrix +
+/// PQ-encode every frame. When all three blob IDs are `None`, smithay leaves
+/// the CRTC color pipeline alone (whatever the kernel last set), and the
+/// caller is expected to do the encode in a postprocess shader instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HdrState {
     /// Raw value for the `Colorspace` enum property on the connector.
@@ -45,17 +56,49 @@ pub struct HdrState {
     /// destroy with `Device::destroy_property_blob(id)` when no longer used.
     /// Pass `0` to clear (kernel treats blob 0 as "no override").
     pub metadata_blob_id: u64,
+
+    /// Optional. Blob ID of a CRTC `DEGAMMA_LUT` blob (array of
+    /// `struct drm_color_lut`, RGB+reserved interleaved, kernel applies
+    /// per-channel before the CTM). Pass `Some(0)` to clear an existing
+    /// LUT, `None` to leave the property untouched.
+    pub degamma_lut_blob_id: Option<u64>,
+
+    /// Optional. Blob ID of a CRTC `CTM` blob (`struct drm_color_ctm` —
+    /// 9-entry sign-magnitude S31.32 matrix, applied to linear RGB).
+    pub ctm_blob_id: Option<u64>,
+
+    /// Optional. Blob ID of a CRTC `GAMMA_LUT` blob — applied per-channel
+    /// after the CTM, output goes to scanout.
+    pub gamma_lut_blob_id: Option<u64>,
 }
 
 impl HdrState {
     /// Convenience: HDR state representing "no HDR" — Colorspace=0 (Default)
-    /// and metadata blob cleared. Useful for explicitly transitioning a
-    /// connector back to SDR through smithay's atomic commit pipeline rather
-    /// than just leaving the previous HDR state stale.
+    /// and metadata blob cleared, plus all CRTC color pipeline blobs cleared
+    /// to 0 (so any previously-staged hardware encode pipeline is torn down
+    /// alongside the SDR signaling fallback).
     pub const fn sdr() -> Self {
         Self {
             colorspace_value: 0,
             metadata_blob_id: 0,
+            degamma_lut_blob_id: Some(0),
+            ctm_blob_id: Some(0),
+            gamma_lut_blob_id: Some(0),
+        }
+    }
+
+    /// Convenience: shader-only HDR (no hardware color pipeline). Same as
+    /// the previous two-field `HdrState` — connector signaling only, no
+    /// CRTC LUT/CTM staging. Use this when the kernel's color pipeline
+    /// props aren't exposed (older drivers) and the caller will run the
+    /// encode in a postprocess shader.
+    pub const fn signaling_only(colorspace_value: u64, metadata_blob_id: u64) -> Self {
+        Self {
+            colorspace_value,
+            metadata_blob_id,
+            degamma_lut_blob_id: None,
+            ctm_blob_id: None,
+            gamma_lut_blob_id: None,
         }
     }
 }

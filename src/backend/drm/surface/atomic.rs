@@ -339,7 +339,19 @@ impl AtomicDrmSurface {
         // return `true`, which routes every render-flip through the full
         // `commit()` path (with all connector state including HDR) instead
         // of the lighter `page_flip()`. On Intel `xe`, that combination is
-        // rejected → "Failed to submit rendering" every frame.
+        // rejected during high-motion frames → "Failed to submit rendering"
+        // → moving-window glitches and z-fighting against the underlying
+        // surface. Tested empirically; reverted from a brief experiment
+        // that diverged pending and relied on commit() syncing back.
+        //
+        // Trade-off: live updates to CRTC color pipeline blobs (CTM /
+        // GAMMA_LUT) won't reach the kernel automatically — they sit in
+        // pending until SOMETHING ELSE triggers a commit() (e.g. a mode
+        // change, fb format change, vrr toggle). Live updates that need
+        // to apply immediately are caller's responsibility — typically by
+        // making any change that triggers a natural commit (e.g. cursor
+        // damage causing a render flip). Phase 3 (wp_color_management_v1)
+        // gives us cleaner per-surface plumbing for live HDR state.
         let mut pending = self.pending.write().unwrap();
         let mut current = self.state.write().unwrap();
         match state {
@@ -1279,14 +1291,24 @@ impl<'a> AtomicRequest<'a> {
         Ok(())
     }
 
-    /// Stage Colorspace + HDR_OUTPUT_METADATA writes for the connector. The
-    /// raw u64 values stored here are passed through `AtomicRequest::build()`
-    /// to `AtomicModeReq::add_property` which discards `property::Value` typing
-    /// and writes the underlying `RawValue` directly — the kernel then matches
-    /// it against the property's actual type (enum / blob) by handle.
+    /// Stage Colorspace + HDR_OUTPUT_METADATA on the connector AND, when
+    /// supplied, the CRTC color pipeline props (DEGAMMA_LUT, CTM, GAMMA_LUT)
+    /// on the connector's bound CRTC. The kernel then runs the static encode
+    /// (sRGB decode + gamut + ref-white scale + PQ) in display-engine
+    /// hardware and the compositor doesn't have to do it in shader. When
+    /// the LUT/CTM blob IDs are `None`, those properties are left untouched
+    /// (caller doing shader-side encode); when they're `Some(0)`, they're
+    /// explicitly cleared (transitioning out of HDR).
+    ///
+    /// The raw u64 values stored here are passed through `AtomicRequest::
+    /// build()` to `AtomicModeReq::add_property` which discards
+    /// `property::Value` typing and writes the underlying `RawValue` directly
+    /// — the kernel then matches it against the property's actual type
+    /// (enum / blob) by handle.
     fn set_connector_hdr(
         &mut self,
         conn: connector::Handle,
+        crtc: crtc::Handle,
         hdr: HdrState,
     ) -> Result<(), Error> {
         let connector_props = self.connector_props.entry(conn).or_default();
@@ -1298,6 +1320,18 @@ impl<'a> AtomicRequest<'a> {
             "HDR_OUTPUT_METADATA",
             property::Value::Blob(hdr.metadata_blob_id),
         );
+        if let Some(blob) = hdr.degamma_lut_blob_id {
+            let crtc_props = self.crtc_props.entry(crtc).or_default();
+            crtc_props.insert("DEGAMMA_LUT", property::Value::Blob(blob));
+        }
+        if let Some(blob) = hdr.ctm_blob_id {
+            let crtc_props = self.crtc_props.entry(crtc).or_default();
+            crtc_props.insert("CTM", property::Value::Blob(blob));
+        }
+        if let Some(blob) = hdr.gamma_lut_blob_id {
+            let crtc_props = self.crtc_props.entry(crtc).or_default();
+            crtc_props.insert("GAMMA_LUT", property::Value::Blob(blob));
+        }
         Ok(())
     }
 
@@ -1509,6 +1543,7 @@ impl<'a> AtomicRequest<'a> {
     fn set_connector_hdr(
         &mut self,
         conn: connector::Handle,
+        crtc: crtc::Handle,
         hdr: HdrState,
     ) -> Result<(), Error> {
         self.request.add_property(
@@ -1521,6 +1556,21 @@ impl<'a> AtomicRequest<'a> {
             self.mapping.conn_prop_handle(conn, "HDR_OUTPUT_METADATA")?,
             property::Value::Blob(hdr.metadata_blob_id),
         );
+        if let Some(blob) = hdr.degamma_lut_blob_id {
+            if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "DEGAMMA_LUT") {
+                self.request.add_property(crtc, prop, property::Value::Blob(blob));
+            }
+        }
+        if let Some(blob) = hdr.ctm_blob_id {
+            if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "CTM") {
+                self.request.add_property(crtc, prop, property::Value::Blob(blob));
+            }
+        }
+        if let Some(blob) = hdr.gamma_lut_blob_id {
+            if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT") {
+                self.request.add_property(crtc, prop, property::Value::Blob(blob));
+            }
+        }
         Ok(())
     }
 
@@ -1799,7 +1849,7 @@ impl<'a> AtomicRequest<'a> {
         for conn in connectors {
             req.set_connector(*conn, crtc)?;
             if let Some(hdr) = hdr_state.get(conn) {
-                req.set_connector_hdr(*conn, *hdr)?;
+                req.set_connector_hdr(*conn, crtc, *hdr)?;
             }
         }
 
