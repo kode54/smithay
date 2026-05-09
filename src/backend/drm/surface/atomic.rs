@@ -1125,11 +1125,25 @@ impl AtomicDrmSurface {
         &self,
         fd: Option<&B>,
     ) -> Result<(), Error> {
-        *self.state.write().unwrap() = if let Some(fd) = fd {
+        // Read the post-reset kernel state into a fresh State.
+        let fresh = if let Some(fd) = fd {
             State::current_state(fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         } else {
             State::current_state(&*self.fd, self.crtc, &mut self.prop_mapping.write().unwrap())?
         };
+        // Replace BOTH `state` (current) and `pending` with the fresh
+        // kernel-read state. Without resetting `pending`, any HdrState in
+        // pending would still reference blob IDs that the kernel destroyed
+        // when the device was reset (DPMS off, VT switch, session
+        // re-activation). The next atomic commit would then send stale
+        // blob IDs to the kernel, which atomic_check rejects → render
+        // failures, garbled framebuffers, or the display getting stuck in
+        // a non-recoverable state on resume. Caller (cosmic-comp's apply
+        // path) is responsible for re-creating any blobs and re-staging
+        // pending state through the normal `set_hdr_state` / set_mode /
+        // etc. paths.
+        *self.state.write().unwrap() = fresh.clone();
+        *self.pending.write().unwrap() = fresh;
         Ok(())
     }
 
