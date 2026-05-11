@@ -54,6 +54,8 @@ use wayland_server::{
     protocol::{wl_output::WlOutput, wl_surface::WlSurface},
 };
 
+use crate::output::Output;
+
 pub mod description;
 pub mod dispatch;
 pub mod surface_state;
@@ -472,43 +474,43 @@ where
     })
 }
 
-/// Notify the compositor that an output's image description has changed.
+/// Notify the compositor that the given smithay [`Output`]'s image description
+/// has changed.
 ///
-/// The compositor calls this when `output_image_description(output)` would now
-/// return a different `Arc<ImageDescription>` than it did before — typically as
-/// a result of toggling `hdr_enabled`, switching colorspace, or hardware mode
-/// changes.
+/// Call this when `output_image_description(output)` would now return a
+/// different `Arc<ImageDescription>` than it did before — typically as a result
+/// of toggling `hdr_enabled`, switching colorspace, or hardware mode changes.
 ///
 /// We fan out `image_description_changed` to every live `wp_color_management_output_v1`
-/// resource bound to that output, and re-evaluate any surface-feedback resources
-/// whose surface lives on the changed output (firing `preferred_changed2` if
-/// their preferred description has shifted).
-pub fn notify_output_image_description_changed<D>(state: &mut D, output: &WlOutput)
+/// whose underlying `wl_output` resolves to this smithay `Output` (across all
+/// clients), and re-evaluate every live surface-feedback resource (firing
+/// `preferred_changed2` if its preferred description's identity has shifted).
+pub fn notify_output_image_description_changed<D>(state: &mut D, output: &Output)
 where
     D: ColorManagementHandler,
 {
-    // Output resources first — fire image_description_changed for any bound to
-    // this output. We need to drop the &mut borrow on color_management_state
-    // before checking each resource's user-data, hence the collect-then-iterate.
+    // Output resources first — fire image_description_changed for any whose
+    // bound wl_output resolves back to the changed smithay Output.
     let cm_state = state.color_management_state();
     let alive_outputs = cm_state.live_output_resources();
-    let target_id = output.id();
     for resource in alive_outputs {
         let data = match resource.data::<OutputResourceData>() {
             Some(d) => d,
             None => continue,
         };
-        if let Ok(bound_output) = data.output.upgrade() {
-            if bound_output.id() == target_id {
+        if let Ok(bound_wl_output) = data.output.upgrade() {
+            if Output::from_resource(&bound_wl_output).as_ref() == Some(output) {
                 resource.image_description_changed();
             }
         }
     }
 
-    // Then sweep feedback resources — re-evaluate preferred description for any
-    // whose surface might be on this output. We can't cheaply know "is this
-    // surface on output X" from smithay's side, so we re-evaluate them all and
-    // let the compositor's preferred_image_description method decide.
+    // Then sweep all feedback resources — re-evaluate preferred description for
+    // each. We can't cheaply know which surfaces are on the changed output, so
+    // we re-evaluate everything and let the compositor's
+    // `preferred_image_description` method decide. The identity comparison
+    // suppresses redundant `preferred_changed` events for surfaces whose
+    // preferred description didn't actually shift.
     let cm_state = state.color_management_state();
     let alive_feedback = cm_state.live_feedback_resources();
     for resource in alive_feedback {
