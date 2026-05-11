@@ -566,6 +566,27 @@ pub trait Element {
     fn is_framebuffer_effect(&self) -> bool {
         false
     }
+
+    /// Returns whether this element is eligible for direct hardware-plane scanout.
+    ///
+    /// Returning `false` forces this element through the renderer composite path
+    /// regardless of the [`FrameFlags`](crate::backend::drm::compositor::FrameFlags)
+    /// passed to the [`DrmCompositor`](crate::backend::drm::compositor::DrmCompositor).
+    /// Useful for compositor-level constraints that smithay can't see — for
+    /// example:
+    ///
+    /// - A surface's `wp_color_management_v1` description doesn't match the
+    ///   output's, so direct scanout would produce wrong colors under HDR.
+    /// - A surface's `wp_color_representation_v1` alpha mode doesn't agree with
+    ///   the kernel's plane composition semantics.
+    /// - Compositor-internal heuristics ruling the element out of scanout for
+    ///   a specific frame.
+    ///
+    /// The default returns `true`, preserving existing behavior for callers
+    /// that don't implement this method.
+    fn allow_direct_scanout(&self) -> bool {
+        true
+    }
 }
 
 /// A single render element
@@ -669,6 +690,10 @@ where
 
     fn is_framebuffer_effect(&self) -> bool {
         (*self).is_framebuffer_effect()
+    }
+
+    fn allow_direct_scanout(&self) -> bool {
+        (*self).allow_direct_scanout()
     }
 }
 
@@ -786,6 +811,10 @@ impl<E: Element> Element for NamespacedElement<E> {
 
     fn is_framebuffer_effect(&self) -> bool {
         self.inner.is_framebuffer_effect()
+    }
+
+    fn allow_direct_scanout(&self) -> bool {
+        self.inner.allow_direct_scanout()
     }
 }
 
@@ -1107,6 +1136,19 @@ macro_rules! render_elements_internal {
                         #[$meta]
                     )*
                     Self::$body(x) => $crate::render_elements_internal!(@call is_framebuffer_effect; x)
+                ),*,
+                Self::_GenericCatcher(_) => unreachable!(),
+            }
+        }
+
+        fn allow_direct_scanout(&self) -> bool {
+            match self {
+                $(
+                    #[allow(unused_doc_comments)]
+                    $(
+                        #[$meta]
+                    )*
+                    Self::$body(x) => $crate::render_elements_internal!(@call allow_direct_scanout; x)
                 ),*,
                 Self::_GenericCatcher(_) => unreachable!(),
             }
@@ -1799,6 +1841,10 @@ where
 
     fn is_framebuffer_effect(&self) -> bool {
         self.0.is_framebuffer_effect()
+    }
+
+    fn allow_direct_scanout(&self) -> bool {
+        self.0.allow_direct_scanout()
     }
 }
 

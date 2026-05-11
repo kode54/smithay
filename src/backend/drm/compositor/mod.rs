@@ -2833,6 +2833,18 @@ where
         if element.is_framebuffer_effect() {
             return Err(None);
         }
+        // Per-element opt-out for direct scanout (Phase 3.3 of the cosmic-comp
+        // HDR experiment). The element implementation can return `false` here
+        // if compositor-level state (e.g. wp_color_management_v1 description
+        // mismatch with the output, wp_color_representation_v1 alpha-mode
+        // mismatch) makes scanout unsafe for this element.
+        if !element.allow_direct_scanout() {
+            trace!(
+                "skipping direct scan-out for element {:?}, allow_direct_scanout=false",
+                element.id()
+            );
+            return Err(None);
+        }
 
         let mut rendering_reason: Option<RenderingReason> = None;
 
