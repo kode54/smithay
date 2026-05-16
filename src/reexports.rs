@@ -5,6 +5,12 @@ pub use ash;
 pub use calloop;
 #[cfg(feature = "backend_drm")]
 pub use drm;
+// Lower-level FFI bindings — needed for callers that have to construct DRM
+// property blobs of runtime-determined size (e.g. CRTC color pipeline LUTs),
+// since the Sized-generic `Device::create_property_blob` can't accept &mut [u8].
+// Used by cosmic-comp's HDR work to create DEGAMMA/GAMMA_LUT blobs.
+#[cfg(feature = "backend_drm")]
+pub use drm_ffi;
 #[cfg(feature = "backend_gbm")]
 pub use gbm;
 #[cfg(feature = "renderer_glow")]
