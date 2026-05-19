@@ -330,38 +330,34 @@ impl AtomicDrmSurface {
         if !self.active.load(Ordering::SeqCst) {
             return Err(Error::DeviceInactive);
         }
-        // Update BOTH pending AND current state. HDR connector props are
-        // "sticky" — once committed they persist on the connector indefinitely
-        // — so for the purpose of `commit_pending()` (which compares pending
-        // vs current) we treat HDR state as immediately-applied bookkeeping.
-        // Without updating current here, pending and current would forever
-        // disagree after `set_hdr_state`, making `commit_pending()` always
-        // return `true`, which routes every render-flip through the full
-        // `commit()` path (with all connector state including HDR) instead
-        // of the lighter `page_flip()`. On Intel `xe`, that combination is
-        // rejected during high-motion frames → "Failed to submit rendering"
-        // → moving-window glitches and z-fighting against the underlying
-        // surface. Tested empirically; reverted from a brief experiment
-        // that diverged pending and relied on commit() syncing back.
+        // Update only `pending`, leaving `current` divergent until the next
+        // `commit()` runs. The divergence makes `commit_pending()` return
+        // true, which forces the next render-flip through the full atomic
+        // `commit()` path that writes all connector + crtc props (CTM /
+        // DEGAMMA_LUT / GAMMA_LUT / Colorspace / HDR_OUTPUT_METADATA). After
+        // that commit() succeeds, the existing path syncs `*current = pending.clone()`
+        // at atomic.rs:957, and subsequent frames see pending == current
+        // and return to the fast `page_flip()` path. Net cost is one extra
+        // atomic commit() per HDR state change, not per frame.
         //
-        // Trade-off: live updates to CRTC color pipeline blobs (CTM /
-        // GAMMA_LUT) won't reach the kernel automatically — they sit in
-        // pending until SOMETHING ELSE triggers a commit() (e.g. a mode
-        // change, fb format change, vrr toggle). Live updates that need
-        // to apply immediately are caller's responsibility — typically by
-        // making any change that triggers a natural commit (e.g. cursor
-        // damage causing a render flip). Phase 3 (wp_color_management_v1)
-        // gives us cleaner per-surface plumbing for live HDR state.
+        // History: this used to update `current` too, to keep
+        // commit_pending() false and avoid forcing commit() on Intel xe
+        // (which historically rejected commits with HDR_OUTPUT_METADATA
+        // alongside other connector state under motion). That issue is
+        // resolved upstream of this layer — kode54's `1110f07d` fix
+        // ensures all DRM property blobs we hand the kernel are correctly
+        // sized payload data (not 24-byte Vec headers), so atomic_check
+        // now accepts our commits. With well-formed blobs, the previous
+        // "one commit() then sync" approach works cleanly and live
+        // updates to CRTC color pipeline blobs (CTM / GAMMA_LUT) reach
+        // the kernel immediately on the next render.
         let mut pending = self.pending.write().unwrap();
-        let mut current = self.state.write().unwrap();
         match state {
             Some(s) => {
                 pending.hdr_state.insert(conn, s);
-                current.hdr_state.insert(conn, s);
             }
             None => {
                 pending.hdr_state.remove(&conn);
-                current.hdr_state.remove(&conn);
             }
         }
         Ok(())
